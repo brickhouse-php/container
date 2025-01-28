@@ -16,7 +16,7 @@ class Container implements ContainerInterface
     /**
      * Defines all the containers bindings.
      *
-     * @var array<string,array{concrete:string,shared:bool}>
+     * @var array<string,list<array{concrete:string,shared:bool}>>
      */
     protected array $bindings = [];
 
@@ -28,14 +28,21 @@ class Container implements ContainerInterface
     protected array $aliases = [];
 
     /**
-     * Defines all the containers singleton instances.
+     * Defines all the container's singleton instances.
      *
      * @var array<string,mixed>
      */
     protected array $instances = [];
 
     /**
-     * Defines all the containers singleton instances.
+     * Defines all the keys of the container's scoped instances.
+     *
+     * @var list<string>
+     */
+    protected array $scopedInstances = [];
+
+    /**
+     * Defines all the containers reflectors.
      *
      * @var array<class-string,\ReflectionClass<*>>
      */
@@ -50,7 +57,11 @@ class Container implements ContainerInterface
      */
     public function has(string $abstract): bool
     {
-        return isset($this->bindings[$abstract]) || $this->isAlias($abstract);
+        if (isset($this->bindings[$abstract]) && !empty($this->bindings[$abstract])) {
+            return true;
+        }
+
+        return $this->isAlias($abstract);
     }
 
     /**
@@ -78,6 +89,32 @@ class Container implements ContainerInterface
     }
 
     /**
+     * Gets the instance from the container with the given abstract name.
+     *
+     * This method exists to be compatible with PSR-11.
+     *
+     * @param string $abstract
+     *
+     * @return mixed
+     *
+     * @throws ContainerEntryMissingException       Thrown if the entry isn't found in the container.
+     */
+    public function getAll(string $abstract): mixed
+    {
+        $bindings = $this->getBindings($abstract);
+        if (empty($bindings)) {
+            throw new ContainerEntryMissingException($abstract);
+        }
+
+        return array_map(
+            fn(mixed $binding) => is_callable($binding)
+                ? $this->call(null, $binding)
+                : $this->resolve($binding),
+            $bindings
+        );
+    }
+
+    /**
      * Aliases the given abstract type to the given concrete type.
      *
      * @param string $abstract
@@ -88,7 +125,7 @@ class Container implements ContainerInterface
     public function alias(string $abstract, string $concrete): void
     {
         if ($abstract === $concrete) {
-            throw new \Exception("Cannot alias abstract to same type: {$abstract}");
+            throw new \InvalidArgumentException("Cannot alias abstract to same type: {$abstract}");
         }
 
         $this->aliases[$abstract] = $concrete;
@@ -134,11 +171,32 @@ class Container implements ContainerInterface
         // If the abstract is an alias, resolve it first.
         $abstract = $this->getAlias($abstract);
 
-        if (($binding = $this->bindings[$abstract] ?? null) !== null) {
-            return $binding["concrete"];
+        $binding = $this->bindings[$abstract] ?? null;
+        if ($binding === null || empty($binding)) {
+            return null;
         }
 
-        return null;
+        return array_slice($binding, -1)[0]["concrete"];
+    }
+
+    /**
+     * Gets all the bound concrete types, which is bound to the given type.
+     *
+     * @param string $abstract
+     *
+     * @return list<mixed>
+     */
+    public function getBindings(string $abstract): array
+    {
+        // If the abstract is an alias, resolve it first.
+        $abstract = $this->getAlias($abstract);
+
+        $binding = $this->bindings[$abstract] ?? null;
+        if ($binding === null || empty($binding)) {
+            return [];
+        }
+
+        return array_column($binding, 'concrete');
     }
 
     /**
@@ -153,11 +211,12 @@ class Container implements ContainerInterface
         // If the abstract is an alias, resolve it first.
         $abstract = $this->getAlias($abstract);
 
-        if (($binding = $this->bindings[$abstract] ?? null) !== null) {
-            return $binding["shared"];
+        $binding = $this->bindings[$abstract] ?? null;
+        if ($binding === null || empty($binding)) {
+            return false;
         }
 
-        return false;
+        return array_slice($binding, -1)[0]["shared"];
     }
 
     /**
@@ -173,7 +232,7 @@ class Container implements ContainerInterface
     {
         $concrete ??= $abstract;
 
-        $this->bindings[$abstract] = [
+        $this->bindings[$abstract][] = [
             "concrete" => $concrete,
             "shared" => $shared,
         ];
@@ -192,6 +251,36 @@ class Container implements ContainerInterface
     {
         if (!$this->has($abstract)) {
             $this->bind($abstract, $concrete, $shared);
+        }
+    }
+
+    /**
+     * Binds a value to the given type in the container as a scoped type.
+     *
+     * @param string                $abstract
+     * @param \Closure|string|null  $concrete
+     *
+     * @return void
+     */
+    public function scoped(string $abstract, \Closure|string|null $concrete = null): void
+    {
+        $this->scopedInstances[] = $abstract;
+
+        $this->singleton($abstract, $concrete);
+    }
+
+    /**
+     * Binds a value to the given type in the container as a scoped type, if the type has not already been bound.
+     *
+     * @param string                $abstract
+     * @param \Closure|string|null  $concrete
+     *
+     * @return void
+     */
+    public function scopedIf(string $abstract, \Closure|string|null $concrete = null): void
+    {
+        if (!$this->has($abstract)) {
+            $this->scoped($abstract, $concrete);
         }
     }
 
@@ -231,7 +320,7 @@ class Container implements ContainerInterface
      *
      * @return void
      */
-    public function instance(string $abstract, $instance): void
+    public function instance(string $abstract, mixed $instance): void
     {
         $this->singleton($abstract, fn() => $instance);
     }
@@ -244,7 +333,7 @@ class Container implements ContainerInterface
      *
      * @return void
      */
-    public function instanceIf(string $abstract, $instance): void
+    public function instanceIf(string $abstract, mixed $instance): void
     {
         if (!$this->has($abstract)) {
             $this->instance($abstract, $instance);
@@ -262,7 +351,7 @@ class Container implements ContainerInterface
      *
      * @return ($abstract is class-string<T> ? T : mixed)
      */
-    public function resolve(string $abstract, array $parameters = [], array $buildStack = [])
+    public function resolve(string $abstract, array $parameters = [], array $buildStack = []): mixed
     {
         $concrete = $this->getBinding($abstract);
         $needsContextualBuild = !empty($parameters);
@@ -300,15 +389,11 @@ class Container implements ContainerInterface
      *
      * @return TReturn
      */
-    public function call($newThis, callable $callable, array $parameters = [], array $buildStack = [])
+    public function call($newThis, callable $callable, array $parameters = [], array $buildStack = []): mixed
     {
         $buildStack[] = $callable;
 
-        try {
-            $reflector = new \ReflectionFunction($callable);
-        } catch (\ReflectionException $e) {
-            throw new ResolutionFailedException("Target closure does not exist.", $buildStack, $e);
-        }
+        $reflector = new \ReflectionFunction($callable);
 
         $dependencies = $reflector->getParameters();
         $instances = $this->resolveDependencies($dependencies, $parameters, $buildStack);
@@ -331,21 +416,21 @@ class Container implements ContainerInterface
      *
      * @return mixed
      */
-    public function build(\Closure|string $concrete, array $parameters = [], array $buildStack = [])
+    public function build(\Closure|string $concrete, array $parameters = [], array $buildStack = []): mixed
     {
+        if ($concrete instanceof \Closure) {
+            return $this->call(null, $concrete, $parameters, $buildStack);
+        }
+
         $buildStack[] = $concrete;
 
         try {
-            if (is_string($concrete)) {
-                $reflector = ($this->reflectors[$concrete] ??= new \ReflectionClass($concrete));
-            } else {
-                $reflector = new \ReflectionClass($concrete);
-            }
+            $reflector = ($this->reflectors[$concrete] ??= new \ReflectionClass($concrete));
         } catch (\ReflectionException $e) {
             throw new ResolutionFailedException("Target class [$concrete] does not exist.", $buildStack, $e);
         }
 
-        if (!$concrete instanceof \Closure && !$reflector->isInstantiable()) {
+        if (!$reflector->isInstantiable()) {
             throw new ResolutionFailedException("Target type [$concrete] cannot be instantiated.", $buildStack);
         }
 
@@ -360,13 +445,19 @@ class Container implements ContainerInterface
         $dependencies = $constructor->getParameters();
         $instances = $this->resolveDependencies($dependencies, $parameters, $buildStack);
 
-        if ($concrete instanceof \Closure) {
-            $instance = $concrete(...$instances);
-        } else {
-            $instance = $reflector->newInstanceArgs($instances);
-        }
+        return $reflector->newInstanceArgs($instances);
+    }
 
-        return $instance;
+    /**
+     * Terminates the container scope and clears all scoped instances.
+     *
+     * @return void
+     */
+    public function terminateScope(): void
+    {
+        foreach ($this->scopedInstances as $scoped) {
+            unset($this->instances[$scoped]);
+        }
     }
 
     /**
@@ -388,6 +479,14 @@ class Container implements ContainerInterface
             $name = $dependency->getName();
             $type = (string) $dependency->getType();
 
+            // `getType` returns a type name which is different from `gettype`,
+            // but only for certain scalars.
+            $type = match ($type) {
+                'int' => 'integer',
+                'bool' => 'boolean',
+                default => $type,
+            };
+
             // If a parameter of the same name is provided, use that instead.
             if (isset($parameters[$name])) {
                 $results[] = $parameters[$name];
@@ -398,7 +497,13 @@ class Container implements ContainerInterface
             // we can attempt to use that.
             $matchingParameter = array_find(
                 $parameters,
-                fn($value) => (is_object($value) ? $value::class : gettype($value)) === $type
+                function (mixed $value) use ($type): bool {
+                    if (is_object($value)) {
+                        return $value::class === $type;
+                    }
+
+                    return gettype($value) === $type;
+                }
             );
 
             if ($matchingParameter !== null) {
@@ -406,9 +511,15 @@ class Container implements ContainerInterface
                 continue;
             }
 
-            $results[] = $isPrimitive
+            $result = $isPrimitive
                 ? $this->resolvePrimitive($dependency, $buildStack)
                 : $this->resolveClass($dependency, $buildStack);
+
+            if (is_array($result) && $type !== 'array') {
+                array_push($results, ...$result);
+            } else {
+                $results[] = $result;
+            }
         }
 
         return $results;
@@ -455,6 +566,7 @@ class Container implements ContainerInterface
     {
         try {
             return $this->resolve($this->getParameterClass($parameter), [], $buildStack);
+            // @codeCoverageIgnoreStart
         } catch (ResolutionFailedException $e) {
             if ($parameter->isDefaultValueAvailable()) {
                 return $parameter->getDefaultValue();
@@ -462,6 +574,7 @@ class Container implements ContainerInterface
 
             throw $e;
         }
+        // @codeCoverageIgnoreEnd
     }
 
     /**
@@ -474,13 +587,10 @@ class Container implements ContainerInterface
     private function getParameterClass(\ReflectionParameter $parameter): ?string
     {
         $type = $parameter->getType();
-
         if (!$type instanceof \ReflectionNamedType || $type->isBuiltin()) {
             return null;
         }
 
-        $name = $type->getName();
-
-        return $name;
+        return $type->getName();
     }
 }
